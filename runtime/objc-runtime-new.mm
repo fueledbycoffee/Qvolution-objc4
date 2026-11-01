@@ -6571,9 +6571,41 @@ resolveMethod_locked(id inst, SEL sel, Class cls, int behavior)
 * cls is the method whose cache should be filled. 
 * implementer is the class that owns the implementation in question.
 **********************************************************************/
+#if defined(DARLING)
+/*
+ * Bring-up diagnostic, off unless CATALYST_MSGLOG is set: the first message each
+ * class receives for each selector, when the implementation lives in one of
+ * Darling's own images (never one inside an application bundle), is appended to
+ * /tmp/catalyst-msgs-<pid> as class, implementing class, selector and image name.
+ * Method caches are filled as usual, so each pair is recorded once, in order.
+ */
+int catalystMsgLogFD = -1;
+
+static void
+catalyst_log_first_send(Class cls, Class implementer, SEL sel)
+{
+    const header_info *hi = _headerForClass(implementer);
+    const char *image = hi ? hi->fname() : "(dynamic)";
+    if (image && strstr(image, ".app/")) return;
+    const char *base = image ? strrchr(image, '/') : NULL;
+    base = base ? base + 1 : (image ? image : "?");
+    char buf[1024];
+    int n = snprintf(buf, sizeof(buf), "%c %s %s %s %s\n",
+                     implementer->isMetaClass() ? '+' : '-',
+                     cls->nameForLogging(), implementer->nameForLogging(),
+                     sel_getName(sel), base);
+    if (n > 0) write(catalystMsgLogFD, buf, (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1);
+}
+#endif
+
 static void
 log_and_fill_cache(Class cls, IMP imp, SEL sel, id receiver, Class implementer)
 {
+#if defined(DARLING)
+    if (slowpath(catalystMsgLogFD >= 0 && implementer)) {
+        catalyst_log_first_send(cls, implementer, sel);
+    }
+#endif
 #if SUPPORT_MESSAGE_LOGGING
     if (slowpath(objcMsgLogEnabled && implementer)) {
         bool cacheIt = logMessageSend(implementer->isMetaClass(), 

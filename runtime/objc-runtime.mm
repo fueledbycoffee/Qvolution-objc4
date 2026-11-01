@@ -372,6 +372,15 @@ void environ_init(void)
         return;
     } 
 
+#if defined(DARLING) && __OBJC2__
+    if (getenv("CATALYST_MSGLOG")) {
+        extern int catalystMsgLogFD;
+        char path[64];
+        snprintf(path, sizeof(path), "/tmp/catalyst-msgs-%d", (int)getpid());
+        catalystMsgLogFD = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0600);
+    }
+#endif
+
     // Turn off autorelease LRU coalescing by default for apps linked against
     // older SDKs. LRU coalescing can reorder releases and certain older apps
     // are accidentally relying on the ordering.
