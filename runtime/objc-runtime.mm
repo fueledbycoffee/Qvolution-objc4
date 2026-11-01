@@ -378,6 +378,8 @@ void environ_init(void)
         char path[64];
         snprintf(path, sizeof(path), "/tmp/catalyst-msgs-%d", (int)getpid());
         catalystMsgLogFD = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0600);
+        extern bool catalystMsgLogRing;
+        catalystMsgLogRing = strcmp(getenv("CATALYST_MSGLOG"), "ring") == 0;
     }
 #endif
 

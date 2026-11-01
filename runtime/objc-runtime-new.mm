@@ -6580,21 +6580,56 @@ resolveMethod_locked(id inst, SEL sel, Class cls, int behavior)
  * Method caches are filled as usual, so each pair is recorded once, in order.
  */
 int catalystMsgLogFD = -1;
+/* CATALYST_MSGLOG=ring: every send to our classes is looked up (no cache
+ * fill) and kept in a ring of the last entries, written out only when the
+ * process faults or traps (catalyst_objc_dump_messages). */
+bool catalystMsgLogRing = false;
+#define CATALYST_RING 256
+static char catalystRing[CATALYST_RING][160];
+static unsigned catalystRingNext;
 
-static void
+/* Returns false when the implementation is not in one of Darling's own
+ * images (an application image, or a class created at run time, whose
+ * image this cannot tell), which is never recorded. */
+static bool
 catalyst_log_first_send(Class cls, Class implementer, SEL sel)
 {
     const header_info *hi = _headerForClass(implementer);
-    const char *image = hi ? hi->fname() : "(dynamic)";
-    if (image && strstr(image, ".app/")) return;
-    const char *base = image ? strrchr(image, '/') : NULL;
-    base = base ? base + 1 : (image ? image : "?");
+    if (hi == NULL) return false;
+    const char *image = hi->fname();
+    if (image == NULL || strstr(image, ".app/")) return false;
+    const char *base = strrchr(image, '/');
+    base = base ? base + 1 : image;
     char buf[1024];
     int n = snprintf(buf, sizeof(buf), "%c %s %s %s %s\n",
                      implementer->isMetaClass() ? '+' : '-',
                      cls->nameForLogging(), implementer->nameForLogging(),
                      sel_getName(sel), base);
-    if (n > 0) write(catalystMsgLogFD, buf, (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1);
+    if (n <= 0) return true;
+    if (catalystMsgLogRing) {
+        char *slot = catalystRing[catalystRingNext++ % CATALYST_RING];
+        size_t len = (size_t)n < sizeof(catalystRing[0]) - 1 ? (size_t)n : sizeof(catalystRing[0]) - 1;
+        memcpy(slot, buf, len);
+        slot[len] = 0;
+        if (len && slot[len - 1] != '\n') { slot[len - 1] = '\n'; }
+    } else {
+        write(catalystMsgLogFD, buf, (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1);
+    }
+    return true;
+}
+
+extern "C" __attribute__((visibility("default"))) void
+catalyst_objc_dump_messages(void)
+{
+    if (catalystMsgLogFD < 0 || !catalystMsgLogRing) return;
+    const char *head = "--- last sends to Darling's classes, oldest first ---\n";
+    write(catalystMsgLogFD, head, strlen(head));
+    unsigned end = catalystRingNext;
+    unsigned start = end > CATALYST_RING ? end - CATALYST_RING : 0;
+    for (unsigned i = start; i < end; i++) {
+        const char *slot = catalystRing[i % CATALYST_RING];
+        write(catalystMsgLogFD, slot, strlen(slot));
+    }
 }
 #endif
 
@@ -6603,7 +6638,8 @@ log_and_fill_cache(Class cls, IMP imp, SEL sel, id receiver, Class implementer)
 {
 #if defined(DARLING)
     if (slowpath(catalystMsgLogFD >= 0 && implementer)) {
-        catalyst_log_first_send(cls, implementer, sel);
+        if (catalyst_log_first_send(cls, implementer, sel) && catalystMsgLogRing)
+            return; // keep it uncached so the next send is recorded too
     }
 #endif
 #if SUPPORT_MESSAGE_LOGGING
