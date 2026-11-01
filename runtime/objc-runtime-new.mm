@@ -6571,9 +6571,222 @@ resolveMethod_locked(id inst, SEL sel, Class cls, int behavior)
 * cls is the method whose cache should be filled. 
 * implementer is the class that owns the implementation in question.
 **********************************************************************/
+#if defined(DARLING)
+/*
+ * Bring-up diagnostic, off unless CATALYST_MSGLOG is set: on each method-cache
+ * miss (so again after a cache flush), a send whose executing IMP and whose
+ * implementing class both lie in a source-built image is appended to
+ * /tmp/catalyst-msgs-<pid> as class, implementing class, selector and image
+ * name. "Source-built" means listed, with its size, in the inventory file
+ * named by CATALYST_MSGLOG_INVENTORY (default CATALYST_INVENTORY_DEFAULT),
+ * which the build side writes from its own install tree. An image is matched
+ * once, when it is added to the header list, by its real path and size. The
+ * inventory must be regenerated after replacement builds. Path and size are
+ * an operational identity check, not protection against same-size replacement.
+ * A receiver class outside the inventory is written as "other". Unknown,
+ * runtime-created (no header) and non-listed implementations are never
+ * recorded; without a readable inventory nothing is.
+ */
+#define CATALYST_INVENTORY_DEFAULT "/usr/share/darling/catalyst-msglog-inventory.txt"
+int catalystMsgLogFD = -1;
+/* CATALYST_MSGLOG=ring: every send to our classes is looked up (no cache
+ * fill) and kept in a ring of the last entries, written out only when the
+ * process faults or traps (catalyst_objc_dump_messages). */
+bool catalystMsgLogRing = false;
+#define CATALYST_RING 256
+static char catalystRing[CATALYST_RING][160];
+static unsigned catalystRingNext;
+/* CATALYST_RING=1 as well: each recorded send is also handed to
+ * libsystem_kernel's per-thread ring, so the faulting thread's own sends are
+ * dumped by its fault report (resolved once in environ_init). */
+void (*catalystThreadRingNote)(const char *);
+
+struct catalyst_inventory_entry { const char *path; off_t size; };
+static catalyst_inventory_entry *catalystInventory;
+static size_t catalystInventoryCount;
+
+/* Source-built images seen so far; read and written under runtimeLock
+ * (appendHeader/removeHeader run inside map_images and unmap_image). */
+struct catalyst_owned_image { const header_info *hi; uintptr_t start, end; const char *name; };
+#define CATALYST_OWNED_MAX 2048
+static catalyst_owned_image catalystOwned[CATALYST_OWNED_MAX];
+static size_t catalystOwnedCount;
+
+static int
+catalyst_inventory_compare(const void *a, const void *b)
+{
+    return strcmp(((const catalyst_inventory_entry *)a)->path,
+                  ((const catalyst_inventory_entry *)b)->path);
+}
+
+/* Inventory lines are "<size> <absolute guest path>"; anything else is skipped. */
+static bool
+catalyst_load_inventory(const char *path)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        st.st_size > (64 << 20)) {
+        close(fd);
+        return false;
+    }
+    char *text = (char *)malloc((size_t)st.st_size + 1);
+    size_t have = 0;
+    while (text && have < (size_t)st.st_size) {
+        ssize_t r = read(fd, text + have, (size_t)st.st_size - have);
+        if (r <= 0) break;
+        have += (size_t)r;
+    }
+    close(fd);
+    if (!text || have != (size_t)st.st_size) { free(text); return false; }
+    text[have] = 0;
+    size_t lines = 0;
+    for (size_t i = 0; i < have; i++) if (text[i] == '\n') lines++;
+    catalystInventory = (catalyst_inventory_entry *)calloc(lines + 1, sizeof(*catalystInventory));
+    if (!catalystInventory) { free(text); return false; }
+    for (char *line = text; line && *line; ) {
+        char *next = strchr(line, '\n');
+        if (next) *next++ = 0;
+        char *sep = strchr(line, ' ');
+        if (sep && sep[1] == '/') {
+            *sep = 0;
+            char *endp;
+            long long size = strtoll(line, &endp, 10);
+            if (endp == sep && size > 0)
+                catalystInventory[catalystInventoryCount++] = { sep + 1, (off_t)size };
+        }
+        line = next;
+    }
+    qsort(catalystInventory, catalystInventoryCount, sizeof(*catalystInventory),
+          catalyst_inventory_compare);
+    return catalystInventoryCount > 0;
+}
+
+void
+catalyst_msglog_init(const char *mode)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/catalyst-msgs-%d", (int)getpid());
+    // secure_open refuses symlinks and files not exclusively ours
+    catalystMsgLogFD = secure_open(path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, geteuid());
+    if (catalystMsgLogFD < 0) return;
+    catalystMsgLogRing = strcmp(mode, "ring") == 0;
+    const char *inventory = getenv("CATALYST_MSGLOG_INVENTORY");
+    if (!inventory || !*inventory) inventory = CATALYST_INVENTORY_DEFAULT;
+    if (!catalyst_load_inventory(inventory)) {
+        char line[PATH_MAX + 80];
+        int n = snprintf(line, sizeof(line),
+                         "# CATALYST_MSGLOG: no usable inventory at %s; nothing is recorded\n",
+                         inventory);
+        if (n > 0) write(catalystMsgLogFD, line, (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1);
+    }
+}
+
+void
+catalyst_msglog_add_image(const header_info *hi)
+{
+    if (catalystMsgLogFD < 0 || catalystInventoryCount == 0) return;
+    if (catalystOwnedCount == CATALYST_OWNED_MAX) return;
+    const char *fname = hi->fname();
+    char real[PATH_MAX];
+    if (!fname || !realpath(fname, real)) return;
+    catalyst_inventory_entry key = { real, 0 };
+    const catalyst_inventory_entry *entry = (const catalyst_inventory_entry *)
+        bsearch(&key, catalystInventory, catalystInventoryCount, sizeof(key),
+                catalyst_inventory_compare);
+    struct stat st;
+    if (!entry || stat(real, &st) != 0 || st.st_size != entry->size) return;
+    unsigned long size = 0;
+    uint8_t *text = getsegmentdata(hi->mhdr(), "__TEXT", &size);
+    if (!text || size == 0) return;
+    const char *base = strrchr(entry->path, '/');
+    catalystOwned[catalystOwnedCount++] = { hi, (uintptr_t)text, (uintptr_t)text + size, base + 1 };
+}
+
+void
+catalyst_msglog_remove_image(const header_info *hi)
+{
+    for (size_t i = 0; i < catalystOwnedCount; i++) {
+        if (catalystOwned[i].hi == hi) {
+            catalystOwned[i] = catalystOwned[--catalystOwnedCount];
+            return;
+        }
+    }
+}
+
+static const catalyst_owned_image *
+catalyst_owned_header(const header_info *hi)
+{
+    if (!hi) return NULL;
+    for (size_t i = 0; i < catalystOwnedCount; i++)
+        if (catalystOwned[i].hi == hi) return &catalystOwned[i];
+    return NULL;
+}
+
+static bool
+catalyst_owned_address(IMP imp)
+{
+    uintptr_t addr = (uintptr_t)imp;
+    for (size_t i = 0; i < catalystOwnedCount; i++)
+        if (addr >= catalystOwned[i].start && addr < catalystOwned[i].end) return true;
+    return false;
+}
+
+/* Returns false, recording nothing, unless both the implementing class and the
+ * executing IMP are in source-built images (a category or method_setImplementation
+ * can put another image's code under one of our classes). */
+static bool
+catalyst_log_first_send(Class cls, Class implementer, SEL sel, IMP imp)
+{
+    runtimeLock.assertLocked();
+    const catalyst_owned_image *owner = catalyst_owned_header(_headerForClass(implementer));
+    if (!owner || !catalyst_owned_address(imp)) return false;
+    const char *receiver = catalyst_owned_header(_headerForClass(cls))
+        ? cls->nameForLogging() : "other";
+    char buf[1024];
+    int n = snprintf(buf, sizeof(buf), "%c %s %s %s %s\n",
+                     implementer->isMetaClass() ? '+' : '-',
+                     receiver, implementer->nameForLogging(),
+                     sel_getName(sel), owner->name);
+    if (n <= 0) return true;
+    if (catalystThreadRingNote) catalystThreadRingNote(buf);
+    if (catalystMsgLogRing) {
+        char *slot = catalystRing[catalystRingNext++ % CATALYST_RING];
+        size_t len = (size_t)n < sizeof(catalystRing[0]) - 1 ? (size_t)n : sizeof(catalystRing[0]) - 1;
+        memcpy(slot, buf, len);
+        slot[len] = 0;
+        if (len && slot[len - 1] != '\n') { slot[len - 1] = '\n'; }
+    } else {
+        write(catalystMsgLogFD, buf, (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1);
+    }
+    return true;
+}
+
+extern "C" __attribute__((visibility("default"))) void
+catalyst_objc_dump_messages(void)
+{
+    if (catalystMsgLogFD < 0 || !catalystMsgLogRing) return;
+    const char *head = "--- last sends to Darling's classes, oldest first ---\n";
+    write(catalystMsgLogFD, head, strlen(head));
+    unsigned end = catalystRingNext;
+    unsigned start = end > CATALYST_RING ? end - CATALYST_RING : 0;
+    for (unsigned i = start; i < end; i++) {
+        const char *slot = catalystRing[i % CATALYST_RING];
+        write(catalystMsgLogFD, slot, strlen(slot));
+    }
+}
+#endif
+
 static void
 log_and_fill_cache(Class cls, IMP imp, SEL sel, id receiver, Class implementer)
 {
+#if defined(DARLING)
+    if (slowpath(catalystMsgLogFD >= 0 && implementer)) {
+        if (catalyst_log_first_send(cls, implementer, sel, imp) && catalystMsgLogRing)
+            return; // keep it uncached so the next send is recorded too
+    }
+#endif
 #if SUPPORT_MESSAGE_LOGGING
     if (slowpath(objcMsgLogEnabled && implementer)) {
         bool cacheIt = logMessageSend(implementer->isMetaClass(), 

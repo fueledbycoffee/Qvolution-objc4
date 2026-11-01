@@ -290,6 +290,11 @@ void appendHeader(header_info *hi)
         LastHeader = hi;
     }
 
+#if defined(DARLING) && __OBJC2__
+    extern void catalyst_msglog_add_image(const header_info *hi);
+    catalyst_msglog_add_image(hi);
+#endif
+
 #if __OBJC2__
     if ((hi->mhdr()->flags & MH_DYLIB_IN_CACHE) == 0) {
         foreach_data_segment(hi->mhdr(), [](const segmentType *seg, intptr_t slide) {
@@ -332,6 +337,11 @@ void removeHeader(header_info *hi)
         prev = current;
     }
 
+#if defined(DARLING) && __OBJC2__
+    extern void catalyst_msglog_remove_image(const header_info *hi);
+    catalyst_msglog_remove_image(hi);
+#endif
+
 #if __OBJC2__
     if ((hi->mhdr()->flags & MH_DYLIB_IN_CACHE) == 0) {
         foreach_data_segment(hi->mhdr(), [](const segmentType *seg, intptr_t slide) {
@@ -371,6 +381,16 @@ void environ_init(void)
         // This includes OBJC_HELP and OBJC_PRINT_OPTIONS themselves.
         return;
     } 
+
+#if defined(DARLING) && __OBJC2__
+    if (getenv("CATALYST_MSGLOG")) {
+        extern void catalyst_msglog_init(const char *mode);
+        catalyst_msglog_init(getenv("CATALYST_MSGLOG"));
+        extern void (*catalystThreadRingNote)(const char *);
+        if (getenv("CATALYST_RING"))
+            catalystThreadRingNote = (void (*)(const char *))dlsym(RTLD_DEFAULT, "catalyst_ring_note");
+    }
+#endif
 
     // Turn off autorelease LRU coalescing by default for apps linked against
     // older SDKs. LRU coalescing can reorder releases and certain older apps
