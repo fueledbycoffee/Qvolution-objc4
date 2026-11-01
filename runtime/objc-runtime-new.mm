@@ -6580,8 +6580,10 @@ resolveMethod_locked(id inst, SEL sel, Class cls, int behavior)
  * name. "Source-built" means listed, with its size, in the inventory file
  * named by CATALYST_MSGLOG_INVENTORY (default CATALYST_INVENTORY_DEFAULT),
  * which the build side writes from its own install tree. An image is matched
- * once, when it is added to the header list, by its real path and size; a
- * receiver class outside the inventory is written as "other". Unknown,
+ * once, when it is added to the header list, by its real path and size. The
+ * inventory must be regenerated after replacement builds. Path and size are
+ * an operational identity check, not protection against same-size replacement.
+ * A receiver class outside the inventory is written as "other". Unknown,
  * runtime-created (no header) and non-listed implementations are never
  * recorded; without a readable inventory nothing is.
  */
