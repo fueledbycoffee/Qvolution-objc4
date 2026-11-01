@@ -6587,6 +6587,10 @@ bool catalystMsgLogRing = false;
 #define CATALYST_RING 256
 static char catalystRing[CATALYST_RING][160];
 static unsigned catalystRingNext;
+/* CATALYST_RING=1 as well: each recorded send is also handed to
+ * libsystem_kernel's per-thread ring, so the faulting thread's own sends are
+ * dumped by its fault report (resolved once in environ_init). */
+void (*catalystThreadRingNote)(const char *);
 
 /* Returns false when the implementation is not in one of Darling's own
  * images (an application image, or a class created at run time, whose
@@ -6606,6 +6610,7 @@ catalyst_log_first_send(Class cls, Class implementer, SEL sel)
                      cls->nameForLogging(), implementer->nameForLogging(),
                      sel_getName(sel), base);
     if (n <= 0) return true;
+    if (catalystThreadRingNote) catalystThreadRingNote(buf);
     if (catalystMsgLogRing) {
         char *slot = catalystRing[catalystRingNext++ % CATALYST_RING];
         size_t len = (size_t)n < sizeof(catalystRing[0]) - 1 ? (size_t)n : sizeof(catalystRing[0]) - 1;
