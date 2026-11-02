@@ -86,3 +86,21 @@ claiming that unsupported callback relocation now works.
 
 These are synthetic metadata fixtures against the real Objective-C runtime,
 not tests of a Swift language runtime, Swift concurrency or a Swift application.
+
+## Replacement default zone
+
+`padded-zone-class-data.m` registers its own malloc zone and makes it the zone
+that serves `calloc`, with the public `malloc_zone_register`/`unregister` calls
+(unregistering moves the last zone into the vacated slot). It then realizes a
+root class and its subclass, so the root's already-realized class data is
+validated against `malloc_size`. Build it for x86_64 only, without ARC, and run
+one mode per fresh process:
+
+    exact       capacity equals the request          PASS line, exit 0
+    padded      capacity is the request plus 8        PASS line, exit 0
+    undersized  capacity is the request minus 8       "corrupt data pointer" abort
+    unowned     the zone disowns its blocks (size 0)  "corrupt data pointer" abort
+
+Exit 77 means the zone did not become the `calloc` zone, so nothing was tested.
+`padded` is the shape of Chromium's PartitionAlloc zone, which Electron apps
+install at startup; before the capacity fix it aborted like `undersized`.

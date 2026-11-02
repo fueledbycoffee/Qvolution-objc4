@@ -2841,9 +2841,10 @@ static void validateAlreadyRealizedClass(Class cls) {
     class_rw_t *rw = cls->data();
     size_t rwSize = malloc_size(rw);
 
-    // Note: this check will need some adjustment if class_rw_t's
-    // size changes to not match the malloc bucket.
-    if (rwSize != sizeof(class_rw_t))
+    // malloc_size is the backing block's capacity, which may exceed the
+    // request: a process may install a default zone with coarser buckets.
+    // Zero (not a heap block) or too small still means corrupt.
+    if (rwSize < sizeof(class_rw_t))
         _objc_fatal("realized class %p has corrupt data pointer %p", cls, rw);
 #endif
 }
