@@ -1175,6 +1175,7 @@ public:
                 if (_u.array[i].cat == cat) {
                     // shift entries to preserve list order
                     memmove(&_u.array[i], &_u.array[i+1], arrayByteSize(_u.count - i - 1));
+                    --_u.count;
                     return;
                 }
             }
